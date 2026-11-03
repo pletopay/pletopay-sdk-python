@@ -35,9 +35,9 @@ dependencies = [
 [project.urls]
 Homepage = "https://docs.pletopay.com"
 Documentation = "https://docs.pletopay.com"
-Repository = "https://github.com/evidenze/pletopay-sdk-python"
-Changelog = "https://github.com/evidenze/pletopay-sdk-python/blob/main/CHANGELOG.md"
-Issues = "https://github.com/evidenze/pletopay-sdk-python/issues"
+Repository = "https://github.com/pletopay/pletopay-sdk-python"
+Changelog = "https://github.com/pletopay/pletopay-sdk-python/blob/main/CHANGELOG.md"
+Issues = "https://github.com/pletopay/pletopay-sdk-python/issues"
 
 [project.optional-dependencies]
 dev = [
