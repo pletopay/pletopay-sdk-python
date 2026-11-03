@@ -1,0 +1,10 @@
+{
+  "status": false,
+  "message": "amount must not be less than 1",
+  "error": {
+    "type": "invalid_request",
+    "code": "parameter_invalid",
+    "param": "amount"
+  },
+  "request_id": "req_01J8Z5X7Q9K2M4N6P8R0S2T4WE"
+}

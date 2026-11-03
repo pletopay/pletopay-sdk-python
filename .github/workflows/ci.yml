@@ -1,0 +1,44 @@
+# Pull-request and main-branch gates. The live suite (tests/live) needs a running API and is not run here.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Lint, types, tests, build (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@6f1a9ca0a2d7e8d7a1aa5d7f6b2a6b2d3a3cc8d6 # v7.1.1
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: uv pip install --system -e ".[dev]"
+      - name: Lint and format
+        run: ruff check src tests scripts examples && ruff format --check src tests scripts examples
+      - name: Typecheck
+        run: mypy
+      - name: Generated code and brand checks
+        run: python scripts/generate_models.py --check && python scripts/generate_operations.py --check && python scripts/check_brand.py
+      - name: Unit tests
+        run: pytest -q --ignore=tests/live
+      - name: Build
+        run: python -m build && python -m twine check dist/*
