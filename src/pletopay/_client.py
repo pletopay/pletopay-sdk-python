@@ -28,7 +28,7 @@ from pletopay._operations import Operation
 from pletopay._pagination import AsyncPage, SyncPage
 from pletopay._query import encode_query
 from pletopay._response import ListMeta, RawResponse, ResponseInfo
-from pletopay._retry import is_retryable_status, retry_delay
+from pletopay._retry import in_progress_delay, is_in_progress, is_retryable_status, retry_delay
 from pletopay._version import __version__
 from pletopay.errors import (
     APIConnectionError,
@@ -97,7 +97,10 @@ _log = logging.getLogger("pletopay")
 
 @dataclass
 class RequestOptions:
-    """Per-call options accepted by every resource method (``options=RequestOptions(...)``)."""
+    """Per-call options accepted by every resource method (``options=RequestOptions(...)``).
+
+    ``timeout`` overrides the client's timeout and the 90 s default of ``transfers.create`` / ``refunds.create``.
+    """
 
     timeout: float | None = None
     max_retries: int | None = None
@@ -153,7 +156,7 @@ class _BaseClient:
         secret_key: str | None,
         base_url: str | None,
         api_version: str | Literal[False] | None,
-        timeout: float,
+        timeout: float | None,
         max_retries: int,
         correlation_id: str | Callable[[], str] | None,
         webhook_secret: str | None,
@@ -174,14 +177,16 @@ class _BaseClient:
             raise PletopayError("The secret key must look like sk_test_… or sk_live_…")
         if not isinstance(max_retries, int) or max_retries < 0:
             raise PletopayError("max_retries must be a non-negative integer")
-        if not timeout or timeout <= 0:
+        if timeout is not None and (not timeout or timeout <= 0):
             raise PletopayError("timeout must be a positive number of seconds")
         self._secret_key = key
         self.mode: Mode = "live" if key.startswith("sk_live_") else "test"
         self.base_url = (base_url or os.environ.get(c.ENV_API_URL) or c.DEFAULT_BASE_URL).rstrip("/")
         # api_version: None → the SDK's pinned version; False → send none (the organization's pin applies).
         self.api_version: str | None = SPEC_API_VERSION if api_version is None else (api_version or None)
-        self.timeout = timeout
+        self.timeout = c.DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout
+        # A timeout the caller chose also overrides the per-operation defaults.
+        self._timeout_is_explicit = timeout is not None
         self.max_retries = max_retries
         self._correlation_id = correlation_id
         self._hooks = hooks or Hooks()
@@ -211,6 +216,7 @@ class _BaseClient:
         options: RequestOptions | None,
         accept: str,
         test_mode_only: bool,
+        default_timeout: float | None = None,
     ) -> _Prepared:
         options = options or RequestOptions()
         if test_mode_only and self.mode == "live":
@@ -247,19 +253,29 @@ class _BaseClient:
             headers["content-type"] = "application/json"
         params = encode_query({**(query or {}), **(options.extra_query or {})})
         max_retries = self.max_retries if options.max_retries is None else options.max_retries
+        if options.timeout is not None:
+            timeout = options.timeout
+        elif default_timeout is not None and not self._timeout_is_explicit:
+            timeout = default_timeout
+        else:
+            timeout = self.timeout
         return _Prepared(
             method=method,
             url=f"{self.base_url}{path}",
             params=params,
             headers=headers,
             content=content,
-            timeout=options.timeout if options.timeout is not None else self.timeout,
+            timeout=timeout,
             max_retries=max_retries,
             retryable=method in ("GET", "DELETE") or key is not None,
             idempotency_key=key,
             accept=accept,
             path=path,
         )
+
+    @staticmethod
+    def _default_timeout(op: Operation) -> float | None:
+        return c.MONEY_OUT_TIMEOUT_SECONDS if op.id in c.MONEY_OUT_OPERATIONS else None
 
     @staticmethod
     def _fill_path(template: str, params: Mapping[str, str] | None) -> str:
@@ -309,26 +325,44 @@ class _BaseClient:
                 info = ResponseInfo(message=message if isinstance(message, str) else "", meta=meta, **info_kwargs)
                 return _Outcome(body["data"], info)
             error = APIError(response.status_code, body, headers, "The API returned an unexpected response body")
-            return _Outcome(None, ResponseInfo(message="", meta=None, **info_kwargs), error)
-        body = _parse_json(response)
-        error = APIError.from_response(response.status_code, body, headers)
+        else:
+            error = APIError.from_response(response.status_code, _parse_json(response), headers)
+        error.idempotency_key = prepared.idempotency_key
         return _Outcome(None, ResponseInfo(message="", meta=None, **info_kwargs), error)
 
     @staticmethod
-    def _retry_decision(prepared: _Prepared, attempt: int, error: APIError, headers: httpx.Headers) -> float | None:
-        if not prepared.retryable or attempt >= prepared.max_retries:
+    def _retry_decision(
+        prepared: _Prepared, retries: int, error: APIError, headers: httpx.Headers, elapsed: float
+    ) -> tuple[float, int] | None:
+        """The wait before the next attempt and the retries spent once it is made, or ``None`` to raise.
+
+        ``elapsed`` is the time since the first attempt of the call started.
+        """
+        retry_after = retry_after_seconds(headers)
+        if (
+            is_in_progress(error.status_code, error.code)
+            and prepared.idempotency_key is not None
+            and prepared.max_retries > 0
+        ):
+            # The first attempt is still running on the API (a slow bank, usually): keep asking with the
+            # same key until it answers or the wait runs out. This does not spend the retry budget.
+            wait = in_progress_delay(elapsed, retry_after=retry_after)
+            return None if wait is None else (wait, retries)
+        if not prepared.retryable or retries >= prepared.max_retries:
             return None
         if not is_retryable_status(error.status_code, error.code):
             return None
-        return retry_delay(
-            attempt, retry_after=retry_after_seconds(headers), status_code=error.status_code, code=error.code
-        )
+        return retry_delay(retries, retry_after=retry_after), retries + 1
 
     @staticmethod
     def _transport_error(prepared: _Prepared, exc: Exception) -> APIConnectionError:
+        error: APIConnectionError
         if isinstance(exc, httpx.TimeoutException):
-            return APITimeoutError(f"{prepared.method} {prepared.path} timed out after {prepared.timeout} s")
-        return APIConnectionError(f"{prepared.method} {prepared.path} failed: {exc}")
+            error = APITimeoutError(f"{prepared.method} {prepared.path} timed out after {prepared.timeout} s")
+        else:
+            error = APIConnectionError(f"{prepared.method} {prepared.path} failed: {exc}")
+        error.idempotency_key = prepared.idempotency_key
+        return error
 
     def _emit(self, hook: Callable[[dict[str, Any]], None] | None, payload: dict[str, Any]) -> None:
         if hook is not None:
@@ -341,7 +375,9 @@ class _BaseClient:
     @staticmethod
     def _to_model(model: type[M], data: Any, info: ResponseInfo) -> M:
         if not isinstance(data, dict):
-            raise APIError(info.status_code, data, info.headers, f"Expected an object for {model.__name__}")
+            error = APIError(info.status_code, data, info.headers, f"Expected an object for {model.__name__}")
+            error.idempotency_key = info.idempotency_key
+            raise error
         try:
             obj = model.model_validate(data)
         except ValidationError as exc:
@@ -386,6 +422,18 @@ def _parse_json(response: httpx.Response) -> Any:
         return text
 
 
+def _is_backward(query: Mapping[str, Any] | None) -> bool:
+    """A list that starts with ``ending_before`` walks towards newer items and continues with ``ending_before``
+    too; every other list continues with ``starting_after``."""
+    return isinstance((query or {}).get("ending_before"), str)
+
+
+def _next_query(query: Mapping[str, Any] | None, cursor: str, backward: bool) -> dict[str, Any]:
+    if backward:
+        return {**(query or {}), "ending_before": cursor, "starting_after": None}
+    return {**(query or {}), "starting_after": cursor, "ending_before": None}
+
+
 def _build(client: httpx.Client | httpx.AsyncClient, prepared: _Prepared) -> httpx.Request:
     return client.build_request(
         prepared.method,
@@ -408,7 +456,8 @@ class Pletopay(_BaseClient):
         base_url: Defaults to ``PLETOPAY_API_URL``, then ``https://api.pletopay.com``.
         api_version: Dated ``PletoPay-Version`` to send. Defaults to the version this SDK's types describe
             (``Pletopay.API_VERSION``); ``False`` sends none so your organization's pin applies.
-        timeout: Per-request timeout in seconds (default 30).
+        timeout: Per-request timeout in seconds. Default 30, and 90 for the calls that pay out inline
+            (``transfers.create``, ``refunds.create``); a value set here applies to every call.
         max_retries: Automatic retries of safe requests on network errors, 429 and 5xx (default 2).
         http_client: Your own ``httpx.Client`` (proxies, custom transports, instrumentation).
         webhook_secret: ``whsec_…`` for ``pletopay.webhooks.construct_event``; defaults to ``PLETOPAY_WEBHOOK_SECRET``.
@@ -442,7 +491,7 @@ class Pletopay(_BaseClient):
         *,
         base_url: str | None = None,
         api_version: str | Literal[False] | None = None,
-        timeout: float = c.DEFAULT_TIMEOUT_SECONDS,
+        timeout: float | None = None,
         max_retries: int = c.DEFAULT_MAX_RETRIES,
         http_client: httpx.Client | None = None,
         correlation_id: str | Callable[[], str] | None = None,
@@ -463,7 +512,7 @@ class Pletopay(_BaseClient):
             hooks=hooks,
             app_info=app_info,
         )
-        self._http = http_client or httpx.Client(timeout=timeout)
+        self._http = http_client or httpx.Client(timeout=self.timeout)
         self._owns_http = http_client is None
         from pletopay.resources import bind_sync
 
@@ -512,7 +561,10 @@ class Pletopay(_BaseClient):
         return RawResponse(outcome.data, outcome.info)
 
     def _send(self, prepared: _Prepared) -> _Outcome:
-        attempt = 0
+        # `attempt` counts requests sent, `retries` the retry budget spent: waiting for a request that is
+        # still in progress sends more requests without spending any.
+        attempt = retries = 0
+        call_started = time.monotonic()
         while True:
             started = time.monotonic()
             self._emit(
@@ -529,8 +581,8 @@ class Pletopay(_BaseClient):
                 response = self._http.send(_build(self._http, prepared))
             except httpx.TransportError as exc:
                 error = self._transport_error(prepared, exc)
-                if prepared.retryable and attempt < prepared.max_retries:
-                    delay = retry_delay(attempt)
+                if prepared.retryable and retries < prepared.max_retries:
+                    delay = retry_delay(retries)
                     self._emit(
                         self._hooks.on_retry, {"attempt": attempt, "reason": type(error).__name__, "delay": delay}
                     )
@@ -539,6 +591,7 @@ class Pletopay(_BaseClient):
                     )
                     time.sleep(delay)
                     attempt += 1
+                    retries += 1
                     continue
                 raise error from exc
             outcome = self._outcome(prepared, response)
@@ -555,10 +608,12 @@ class Pletopay(_BaseClient):
             )
             if outcome.error is None:
                 return outcome
-            wait = self._retry_decision(prepared, attempt, outcome.error, response.headers)
-            if wait is None:
+            decision = self._retry_decision(
+                prepared, retries, outcome.error, response.headers, time.monotonic() - call_started
+            )
+            if decision is None:
                 raise outcome.error
-            delay = wait
+            delay, retries = decision
             self._emit(
                 self._hooks.on_retry,
                 {
@@ -609,6 +664,7 @@ class Pletopay(_BaseClient):
             options=options,
             accept=op.accept,
             test_mode_only=op.test_mode_only,
+            default_timeout=self._default_timeout(op),
         )
         outcome = self._send(prepared)
         return self._materialise(op, outcome.data, outcome.info)
@@ -624,6 +680,8 @@ class Pletopay(_BaseClient):
         idempotency_key: str | None = None,
         options: RequestOptions | None = None,
     ) -> SyncPage[M]:
+        backward = _is_backward(query)
+
         def fetch(q: Mapping[str, Any] | None) -> SyncPage[M]:
             prepared = self._prepare(
                 op.method,
@@ -639,9 +697,7 @@ class Pletopay(_BaseClient):
             outcome = self._send(prepared)
             items: list[M] = self._materialise(op, outcome.data, outcome.info)
             return SyncPage(
-                items,
-                outcome.info,
-                lambda cursor: fetch({**(q or {}), "starting_after": cursor, "ending_before": None}),
+                items, outcome.info, lambda cursor: fetch(_next_query(q, cursor, backward)), backward=backward
             )
 
         return fetch(query)
@@ -682,7 +738,7 @@ class AsyncPletopay(_BaseClient):
         *,
         base_url: str | None = None,
         api_version: str | Literal[False] | None = None,
-        timeout: float = c.DEFAULT_TIMEOUT_SECONDS,
+        timeout: float | None = None,
         max_retries: int = c.DEFAULT_MAX_RETRIES,
         http_client: httpx.AsyncClient | None = None,
         correlation_id: str | Callable[[], str] | None = None,
@@ -703,7 +759,7 @@ class AsyncPletopay(_BaseClient):
             hooks=hooks,
             app_info=app_info,
         )
-        self._http = http_client or httpx.AsyncClient(timeout=timeout)
+        self._http = http_client or httpx.AsyncClient(timeout=self.timeout)
         self._owns_http = http_client is None
         from pletopay.resources import bind_async
 
@@ -747,7 +803,10 @@ class AsyncPletopay(_BaseClient):
         return RawResponse(outcome.data, outcome.info)
 
     async def _send(self, prepared: _Prepared) -> _Outcome:
-        attempt = 0
+        # `attempt` counts requests sent, `retries` the retry budget spent: waiting for a request that is
+        # still in progress sends more requests without spending any.
+        attempt = retries = 0
+        call_started = time.monotonic()
         while True:
             started = time.monotonic()
             self._emit(
@@ -764,8 +823,8 @@ class AsyncPletopay(_BaseClient):
                 response = await self._http.send(_build(self._http, prepared))
             except httpx.TransportError as exc:
                 error = self._transport_error(prepared, exc)
-                if prepared.retryable and attempt < prepared.max_retries:
-                    delay = retry_delay(attempt)
+                if prepared.retryable and retries < prepared.max_retries:
+                    delay = retry_delay(retries)
                     self._emit(
                         self._hooks.on_retry, {"attempt": attempt, "reason": type(error).__name__, "delay": delay}
                     )
@@ -774,6 +833,7 @@ class AsyncPletopay(_BaseClient):
                     )
                     await asyncio.sleep(delay)
                     attempt += 1
+                    retries += 1
                     continue
                 raise error from exc
             outcome = self._outcome(prepared, response)
@@ -790,10 +850,12 @@ class AsyncPletopay(_BaseClient):
             )
             if outcome.error is None:
                 return outcome
-            wait = self._retry_decision(prepared, attempt, outcome.error, response.headers)
-            if wait is None:
+            decision = self._retry_decision(
+                prepared, retries, outcome.error, response.headers, time.monotonic() - call_started
+            )
+            if decision is None:
                 raise outcome.error
-            delay = wait
+            delay, retries = decision
             self._emit(
                 self._hooks.on_retry,
                 {
@@ -844,6 +906,7 @@ class AsyncPletopay(_BaseClient):
             options=options,
             accept=op.accept,
             test_mode_only=op.test_mode_only,
+            default_timeout=self._default_timeout(op),
         )
         outcome = await self._send(prepared)
         return self._materialise(op, outcome.data, outcome.info)
@@ -859,6 +922,8 @@ class AsyncPletopay(_BaseClient):
         idempotency_key: str | None = None,
         options: RequestOptions | None = None,
     ) -> AsyncPage[M]:
+        backward = _is_backward(query)
+
         async def fetch(q: Mapping[str, Any] | None) -> AsyncPage[M]:
             prepared = self._prepare(
                 op.method,
@@ -875,8 +940,8 @@ class AsyncPletopay(_BaseClient):
             items: list[M] = self._materialise(op, outcome.data, outcome.info)
 
             async def next_page(cursor: str) -> AsyncPage[M]:
-                return await fetch({**(q or {}), "starting_after": cursor, "ending_before": None})
+                return await fetch(_next_query(q, cursor, backward))
 
-            return AsyncPage(items, outcome.info, next_page)
+            return AsyncPage(items, outcome.info, next_page, backward=backward)
 
         return await fetch(query)

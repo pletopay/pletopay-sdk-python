@@ -15,6 +15,11 @@ import httpx
 class PletopayError(Exception):
     """Base class of every error this SDK raises."""
 
+    #: The ``Idempotency-Key`` the failed request carried (yours or generated), on every error from such a
+    #: request: timeouts, connection errors and API errors alike. Retry with it, or look the object up by
+    #: your ``reference``, before treating the call as failed. ``None`` when the request had no key.
+    idempotency_key: str | None = None
+
 
 class RateLimitInfo:
     """The ``RateLimit-*`` headers of a response."""
@@ -194,7 +199,11 @@ class APIConnectionError(PletopayError):
 
 
 class APITimeoutError(APIConnectionError):
-    """The request exceeded the timeout."""
+    """The request exceeded the timeout.
+
+    The API may still have received it: a timed-out transfer or refund has not failed. Retry with
+    ``idempotency_key``, or retrieve it by your ``reference``.
+    """
 
 
 class SignatureVerificationError(PletopayError):

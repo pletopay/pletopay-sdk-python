@@ -56,7 +56,7 @@ client = pletopay.Pletopay(
     secret_key="sk_test_...",          # default: PLETOPAY_SECRET_KEY
     base_url="https://api.pletopay.com",  # default: PLETOPAY_API_URL, then this
     api_version="2026-09-25",          # the dated version this SDK's models describe (default); False to use your organization's pin
-    timeout=30.0,                      # seconds, per request
+    timeout=30.0,                      # seconds, per request; when omitted: 30, and 90 for transfers.create and refunds.create
     max_retries=2,                     # see Retries
     webhook_secret="whsec_...",        # for client.webhooks.construct_event (default: PLETOPAY_WEBHOOK_SECRET)
     http_client=httpx.Client(proxy="http://proxy:3128"),  # your own httpx client: proxies, transports, instrumentation
@@ -140,6 +140,15 @@ for payment in client.payments.list(status="succeeded").auto_paging_iter():
 first_hundred = client.transfers.list().auto_paging_list(limit=100)
 ```
 
+Lists are newest first, and `auto_paging_iter()` walks towards older objects. Start a list with `ending_before` to go the other way, for example to pick up everything created since the last object you processed:
+
+```python
+for payment in client.payments.list(ending_before=last_seen_payment_id).auto_paging_iter():
+    ...  # every payment newer than last_seen_payment_id, oldest first
+```
+
+On such a list, `auto_paging_iter()` and `auto_paging_list()` yield oldest to newest across all pages, `next_page()` / `pages()` move to the next newer page, and `page.next_cursor` is the id to pass as `ending_before` (not `starting_after`). Each `page.data`, and iterating a single page, stays in the order the API returned it: newest first.
+
 Filters use the API's bracket syntax under the hood (`created[gte]`, `amount[lte]`, `expand[]`); pass plain dicts, lists and `datetime` objects.
 
 ## Errors
@@ -171,11 +180,27 @@ except pletopay.APIError as error:
 | `APIConnectionError` / `APITimeoutError` | no response / timeout exceeded |
 | `SignatureVerificationError` | a webhook did not verify |
 
-All of them extend `PletopayError`. `request_id` is on every API error: quote it to support. The full catalogue of codes is in the [API reference](https://docs.pletopay.com/reference/errors).
+All of them extend `PletopayError`. `request_id` is on every API error: quote it to support. `idempotency_key` is on every error from a request that carried an `Idempotency-Key`, including timeouts and connection errors (see below). The full catalogue of codes is in the [API reference](https://docs.pletopay.com/reference/errors).
 
 ## Retries and idempotency
 
 Network errors, timeouts, `429`, `500`, `502`, `503` and `409 idempotency_request_in_progress` are retried up to `max_retries` times (default 2) with exponential backoff and jitter, honouring `Retry-After`. A request is retried only when that is safe: `GET`/`DELETE`, or a write that carries an `Idempotency-Key`. Writes to endpoints that accept the header get a generated UUID key when you do not pass one, so the retry replays the same request instead of acting twice.
+
+`transfers.create` and `refunds.create` answer only once the bank has, which can take up to 75 seconds. Their default timeout is therefore 90 seconds instead of 30; a `timeout` you set on the client or in `RequestOptions` still wins.
+
+`409 idempotency_request_in_progress` means the first attempt with that key is still running. When retries are on (`max_retries` > 0), the SDK asks again with the same key about every 2 seconds (or after `Retry-After`) without using up `max_retries`, until the first attempt answers or 90 seconds have passed since the call started. Then it raises the `IdempotencyError`.
+
+**A timeout or a connection error on a transfer or refund does not mean it failed.** The API may have received the request and may still pay out. Every error raised for a request that carried an `Idempotency-Key` exposes it as `error.idempotency_key`, whether you passed the key or the SDK generated it. Use it before you tell anyone the money did not move:
+
+```python
+try:
+    client.transfers.create(**payout, idempotency_key="payout-PAYOUT-2026-0001")
+except pletopay.PletopayError as error:
+    if error.idempotency_key:
+        # Same key and same body: the API replays the first outcome instead of paying twice.
+        client.transfers.create(**payout, idempotency_key=error.idempotency_key)
+        # Or look it up: client.transfers.retrieve_by_reference(payout["reference"])
+```
 
 ## Webhooks
 

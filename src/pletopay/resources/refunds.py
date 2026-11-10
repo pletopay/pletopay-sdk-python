@@ -24,6 +24,9 @@ class Refunds(SyncAPIResource):
     ) -> Refund:
         """Refunds a payment (whole, or ``amount`` of it). The API requires an ``Idempotency-Key``: pass a
         deterministic ``idempotency_key`` (e.g. ``refund-<your id>``); the SDK generates a random one only when you omit it.
+
+        The API answers once the bank has, so the default timeout is 90 s. A timeout or connection error does
+        not mean the refund failed: retry with the raised error's ``idempotency_key``.
         """
         return self._client._call(
             ops.CREATE_REFUND,
